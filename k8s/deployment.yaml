@@ -14,8 +14,8 @@ spec:
     spec:
       containers:
         - name: attention-metrics-server
-          image: attention-metrics-server:latest
-          imagePullPolicy: Never
+          image: ghcr.io/vinhthang/attention-metrics-server:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:
