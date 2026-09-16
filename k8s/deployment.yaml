@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attention-metrics-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: attention-metrics-server
+  template:
+    metadata:
+      labels:
+        app: attention-metrics-server
+    spec:
+      containers:
+        - name: attention-metrics-server
+          image: attention-metrics-server:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              value: "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"
