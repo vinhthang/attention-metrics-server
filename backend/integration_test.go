@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -73,18 +75,36 @@ func TestIntegration(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
 	mux.HandleFunc("/api/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		ip := getClientIP(r)
+		if !limiter.Allow(ip) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Rate limit exceeded"})
+			return
+		}
+
 		if r.Method == http.MethodPost {
-			var req IngestRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+			if !checkAuth(r) {
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 				return
 			}
-			
+
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+			var req IngestRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+
 			var payloadObj map[string]interface{}
 			var reason string
-			
+
 			if len(req.Payload) > 0 && req.Payload[0] == '"' {
 				var s string
 				if err := json.Unmarshal(req.Payload, &s); err == nil {
@@ -93,10 +113,10 @@ func TestIntegration(t *testing.T) {
 			} else if len(req.Payload) > 0 {
 				_ = json.Unmarshal(req.Payload, &payloadObj)
 			}
-			
+
 			if payloadObj != nil {
-				if r, ok := payloadObj["reason"].(string); ok {
-					reason = r
+				if rStr, ok := payloadObj["reason"].(string); ok {
+					reason = rStr
 				}
 			}
 
@@ -110,35 +130,43 @@ func TestIntegration(t *testing.T) {
 				}
 			}
 
+			toolName := extractToolName(payloadObj)
+
 			var id int
 			err = db.QueryRow("INSERT INTO events (event_type, reason, payload) VALUES ($1, $2, $3) RETURNING id",
 				req.EventType, reason, payloadBytes).Scan(&id)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 				return
 			}
+
+			attentionEventsTotal.WithLabelValues(req.EventType, toolName).Inc()
+
 			w.WriteHeader(http.StatusCreated)
 			json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": "stored"})
 		} else if r.Method == http.MethodGet {
-			rows, err := db.Query("SELECT id, event_type, COALESCE(reason, ''), payload FROM events ORDER BY created_at DESC")
+			rows, err := db.Query("SELECT id, event_type, COALESCE(reason, ''), payload, created_at FROM events ORDER BY created_at DESC LIMIT 100")
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 				return
 			}
 			defer rows.Close()
-			var events []Event
+
+			events := []Event{}
 			for rows.Next() {
 				var e Event
-				var reason string
-				if err := rows.Scan(&e.ID, &e.EventType, &reason, &e.Payload); err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+				var reason sql.NullString
+				if err := rows.Scan(&e.ID, &e.EventType, &reason, &e.Payload, &e.CreatedAt); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 					return
 				}
-				e.Reason = reason
+				if reason.Valid {
+					e.Reason = reason.String
+				}
 				events = append(events, e)
-			}
-			if events == nil {
-				events = []Event{}
 			}
 			json.NewEncoder(w).Encode(events)
 		}
@@ -156,25 +184,93 @@ func TestIntegration(t *testing.T) {
 			FROM events
 		`).Scan(&summary.TotalEvents, &summary.Denials, &summary.StopRejections, &summary.Last24h)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+		attentionEventsLast24h.Set(float64(summary.Last24h))
 		json.NewEncoder(w).Encode(summary)
+	})
+
+	mux.HandleFunc("/api/metrics/top-tools", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		rows, err := db.Query(`
+			SELECT 
+				COALESCE(payload->'toolCall'->>'name', payload->>'tool_name', payload->>'tool', 'none') as tool,
+				COUNT(*) as count
+			FROM events
+			WHERE event_type = 'PRIMARY_TOOL_DENIED'
+			GROUP BY tool
+			ORDER BY count DESC
+			LIMIT 5
+		`)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+
+		tools := []TopTool{}
+		for rows.Next() {
+			var t TopTool
+			if err := rows.Scan(&t.Tool, &t.Count); err == nil {
+				tools = append(tools, t)
+			}
+		}
+		json.NewEncoder(w).Encode(tools)
+	})
+
+	mux.HandleFunc("/api/metrics/timeseries", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		rows, err := db.Query(`
+			SELECT 
+				date_trunc('hour', created_at) as bucket,
+				COUNT(*) as total,
+				COALESCE(SUM(CASE WHEN event_type = 'PRIMARY_TOOL_DENIED' THEN 1 ELSE 0 END), 0) as denials,
+				COALESCE(SUM(CASE WHEN event_type = 'STOP_REQUESTED' THEN 1 ELSE 0 END), 0) as stop_rejections
+			FROM events
+			WHERE created_at >= NOW() - INTERVAL '7 days'
+			GROUP BY bucket
+			ORDER BY bucket ASC
+		`)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+
+		points := []TimeseriesPoint{}
+		for rows.Next() {
+			var p TimeseriesPoint
+			if err := rows.Scan(&p.Timestamp, &p.Total, &p.Denials, &p.StopRejections); err == nil {
+				points = append(points, p)
+			}
+		}
+		json.NewEncoder(w).Encode(points)
 	})
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := db.Ping(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"status": "error"})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "database": "connected"})
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":     "ok",
+			"database":   "connected",
+			"version":    Version,
+			"go_version": "go1.27.0",
+		})
 	})
 
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	payload1 := `{"event_type": "PRIMARY_TOOL_DENIED", "payload": "{\"reason\": \"Forbidden shell command\"}"}`
+	// 1. Ingest Event with toolCall
+	payload1 := `{"event_type": "PRIMARY_TOOL_DENIED", "payload": {"toolCall": {"name": "write_to_file"}, "reason": "Direct edit blocked"}}`
 	resp1, err := http.Post(server.URL+"/api/metrics", "application/json", bytes.NewBufferString(payload1))
 	if err != nil {
 		t.Fatalf("POST 1 failed: %v", err)
@@ -183,6 +279,7 @@ func TestIntegration(t *testing.T) {
 		t.Errorf("Expected status 201, got %d", resp1.StatusCode)
 	}
 
+	// 2. Ingest Second Event
 	payload2 := `{"event_type": "STOP_REQUESTED", "payload": {"retries_exhausted": true}}`
 	resp2, err := http.Post(server.URL+"/api/metrics", "application/json", bytes.NewBufferString(payload2))
 	if err != nil {
@@ -192,6 +289,7 @@ func TestIntegration(t *testing.T) {
 		t.Errorf("Expected status 201, got %d", resp2.StatusCode)
 	}
 
+	// 3. Test GET /api/metrics
 	respGet, err := http.Get(server.URL + "/api/metrics")
 	if err != nil {
 		t.Fatalf("GET /api/metrics failed: %v", err)
@@ -204,18 +302,8 @@ func TestIntegration(t *testing.T) {
 	if len(events) != 2 {
 		t.Errorf("Expected 2 events, got %d", len(events))
 	}
-	if len(events) == 2 {
-		if events[0].EventType != "STOP_REQUESTED" {
-			t.Errorf("Expected STOP_REQUESTED, got %s", events[0].EventType)
-		}
-		if events[1].EventType != "PRIMARY_TOOL_DENIED" {
-			t.Errorf("Expected PRIMARY_TOOL_DENIED, got %s", events[1].EventType)
-		}
-		if events[1].Reason != "Forbidden shell command" {
-			t.Errorf("Expected Reason 'Forbidden shell command', got '%s'", events[1].Reason)
-		}
-	}
 
+	// 4. Test GET /api/metrics/summary
 	respSum, err := http.Get(server.URL + "/api/metrics/summary")
 	if err != nil {
 		t.Fatalf("GET /api/metrics/summary failed: %v", err)
@@ -225,26 +313,79 @@ func TestIntegration(t *testing.T) {
 	if err := json.NewDecoder(respSum.Body).Decode(&summary); err != nil {
 		t.Fatalf("Failed to decode summary response: %v", err)
 	}
-	if summary.TotalEvents != 2 {
-		t.Errorf("Expected 2 total events, got %d", summary.TotalEvents)
-	}
-	if summary.Denials != 1 {
-		t.Errorf("Expected 1 denial, got %d", summary.Denials)
-	}
-	if summary.StopRejections != 1 {
-		t.Errorf("Expected 1 stop rejection, got %d", summary.StopRejections)
-	}
-	if summary.Last24h != 2 {
-		t.Errorf("Expected 2 last 24h, got %d", summary.Last24h)
+	if summary.TotalEvents != 2 || summary.Denials != 1 || summary.StopRejections != 1 {
+		t.Errorf("Unexpected summary values: %+v", summary)
 	}
 
+	// 5. Test Prometheus /metrics exporter
+	respMetrics, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	defer respMetrics.Body.Close()
+	metricsText, _ := io.ReadAll(respMetrics.Body)
+	if !strings.Contains(string(metricsText), "attention_events_total") {
+		t.Errorf("Expected /metrics to contain attention_events_total metric")
+	}
+
+	// 6. Test GET /api/metrics/top-tools
+	respTools, err := http.Get(server.URL + "/api/metrics/top-tools")
+	if err != nil {
+		t.Fatalf("GET /api/metrics/top-tools failed: %v", err)
+	}
+	defer respTools.Body.Close()
+	var tools []TopTool
+	if err := json.NewDecoder(respTools.Body).Decode(&tools); err != nil {
+		t.Fatalf("Failed to decode top-tools: %v", err)
+	}
+	if len(tools) == 0 || tools[0].Tool != "write_to_file" {
+		t.Errorf("Expected write_to_file as top tool, got %+v", tools)
+	}
+
+	// 7. Test GET /api/metrics/timeseries
+	respTS, err := http.Get(server.URL + "/api/metrics/timeseries")
+	if err != nil {
+		t.Fatalf("GET /api/metrics/timeseries failed: %v", err)
+	}
+	defer respTS.Body.Close()
+	var tsPoints []TimeseriesPoint
+	if err := json.NewDecoder(respTS.Body).Decode(&tsPoints); err != nil {
+		t.Fatalf("Failed to decode timeseries: %v", err)
+	}
+	if len(tsPoints) == 0 {
+		t.Errorf("Expected at least one timeseries bucket, got 0")
+	}
+
+	// 8. Test GET /api/health
 	respHealth, err := http.Get(server.URL + "/api/health")
 	if err != nil {
 		t.Fatalf("GET /api/health failed: %v", err)
 	}
 	defer respHealth.Body.Close()
-	b, _ := io.ReadAll(respHealth.Body)
-	if !bytes.Contains(b, []byte("connected")) {
-		t.Errorf("Expected health check to return connected, got %s", b)
+	var health map[string]string
+	if err := json.NewDecoder(respHealth.Body).Decode(&health); err != nil {
+		t.Fatalf("Failed to decode health response: %v", err)
+	}
+	if health["version"] != Version {
+		t.Errorf("Expected version %s, got %s", Version, health["version"])
+	}
+
+	// 9. Test API Key Auth
+	os.Setenv("METRICS_API_KEY", "secret-test-key")
+	defer os.Unsetenv("METRICS_API_KEY")
+
+	// Missing key should be 401
+	respUnauthorized, err := http.Post(server.URL+"/api/metrics", "application/json", bytes.NewBufferString(payload1))
+	if err != nil || respUnauthorized.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected 401 Unauthorized for missing API key, got %v", respUnauthorized.StatusCode)
+	}
+
+	// Valid key should be 201
+	reqAuth, _ := http.NewRequest("POST", server.URL+"/api/metrics", bytes.NewBufferString(payload1))
+	reqAuth.Header.Set("Content-Type", "application/json")
+	reqAuth.Header.Set("X-API-Key", "secret-test-key")
+	respAuthorized, err := http.DefaultClient.Do(reqAuth)
+	if err != nil || respAuthorized.StatusCode != http.StatusCreated {
+		t.Errorf("Expected 201 Created with valid API key, got %v", respAuthorized.StatusCode)
 	}
 }

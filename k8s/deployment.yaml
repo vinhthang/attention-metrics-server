@@ -17,7 +17,9 @@ spec:
           image: ghcr.io/vinhthang/attention-metrics-server:latest
           imagePullPolicy: Always
           ports:
-            - containerPort: 8080
+            - containerPort: 8086
           env:
+            - name: PORT
+              value: "8086"
             - name: DATABASE_URL
               value: "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"

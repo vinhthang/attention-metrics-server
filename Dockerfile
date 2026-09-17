@@ -7,7 +7,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # Build backend
-FROM golang:alpine AS build-backend
+FROM golang:1.27-alpine AS build-backend
 WORKDIR /app
 COPY backend/go.mod backend/go.sum ./
 RUN go mod download
@@ -19,5 +19,5 @@ FROM alpine:latest
 WORKDIR /app
 COPY --from=build-backend /app/server .
 COPY --from=build-frontend /app/dist ./frontend/dist
-EXPOSE 8080
+EXPOSE 8086
 CMD ["./server"]

@@ -5,8 +5,8 @@ metadata:
 spec:
   type: NodePort
   ports:
-    - port: 8080
-      targetPort: 8080
-      nodePort: 30080
+    - port: 8086
+      targetPort: 8086
+      nodePort: 30012
   selector:
     app: attention-metrics-server
